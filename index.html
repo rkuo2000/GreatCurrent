@@ -203,7 +203,13 @@ dialog.lightbox::backdrop { background: rgba(0,0,0,.94); }
 .lb-inner img { max-width: 100%; max-height: calc(100% - 70px); object-fit: contain; box-shadow: 0 30px 120px rgba(0,0,0,.9), 0 0 0 1px rgba(227,184,102,.18); }
 .lb-cap { text-align: center; font-family: var(--serif); letter-spacing: .25em; color: var(--gold-hi); }
 .lb-cap span { display: block; font-family: var(--zh); color: var(--ink-dim); letter-spacing: .3em; font-size: 14px; }
-.lb-close { position: absolute; top: 14px; right: 14px; }
+.lb-close { position: absolute; top: 14px; right: 14px; z-index: 2; }
+.lb-status { position: absolute; top: 22px; left: 22px; z-index: 2; margin: 0; font-family: var(--serif); font-size: 11px; letter-spacing: .25em; color: var(--ink-dim); pointer-events: none; }
+.lb-ocean { position: absolute; inset: 0; width: 100%; height: 100%; display: block; opacity: 0; transition: opacity .9s ease; cursor: crosshair; touch-action: none; }
+.lb-inner img { transition: opacity .9s ease; }
+.lightbox.ocean-on .lb-ocean { opacity: 1; }
+.lightbox.ocean-on .lb-inner { pointer-events: none; }
+.lightbox.ocean-on .lb-inner img { opacity: 0; }
 
 /* ───────── Responsive ───────── */
 @media (max-width: 1080px) { .jb-keys { display: none; } }
@@ -306,6 +312,7 @@ dialog.lightbox::backdrop { background: rgba(0,0,0,.94); }
     <img id="lbImg" alt="">
     <div class="lb-cap" id="lbCap"></div>
   </div>
+  <p class="lb-status" id="lbStatus" aria-live="polite"></p>
   <button class="icon-btn big lb-close" id="lbClose" type="button" aria-label="關閉"><svg viewBox="0 0 24 24"><path d="M18.3 7.1 16.9 5.7 12 10.6 7.1 5.7 5.7 7.1l4.9 4.9-4.9 4.9 1.4 1.4 4.9-4.9 4.9 4.9 1.4-1.4-4.9-4.9z"/></svg></button>
 </dialog>
 
@@ -947,14 +954,231 @@ flipper.addEventListener('click', e => {
 
 /* ════════════════════ LIGHTBOX ════════════════════ */
 const lb = $('#lightbox');
-function openLightbox(i) {
-  const s = SONGS[i];
-  $('#lbImg').src = s.art; $('#lbImg').alt = `《${s.zh}》放大`;
+let lbToken = 0;
+async function openLightbox(i) {
+  const s = SONGS[i], img = $('#lbImg'), token = ++lbToken;
+  img.src = s.art; img.alt = `《${s.zh}》放大`;
   $('#lbCap').innerHTML = `${esc(s.en)}<span>${esc(s.zh)}</span>`;
   lb.showModal();
+  const status = $('#lbStatus');
+  if (reduce) { status.textContent = '已開啟「減少動態效果」，海浪特效關閉'; return; }
+  if (!CAN_EMBED) { status.textContent = '海浪特效需以 http(s) 開啟（例：python3 -m http.server）'; return; }
+  status.textContent = 'OCEAN · LOADING…';
+  const ocean = await getOcean();
+  try { await img.decode(); } catch (e) { status.textContent = '圖片載入失敗'; return; }
+  if (token !== lbToken || !lb.open) return;
+  if (!ocean) { status.textContent = `海浪特效無法啟用：${oceanErr}`; return; }
+  const tex = await ocean.load(s.art);
+  if (token !== lbToken || !lb.open) return;
+  if (!tex) { status.textContent = '海浪特效無法讀取圖片'; return; }
+  ocean.start(tex);
+  status.textContent = `OCEAN · ${ocean.backend}`;
 }
 $('#lbClose').addEventListener('click', () => lb.close());
 lb.addEventListener('click', e => { if (e.target === lb || e.target.classList.contains('lb-inner')) lb.close(); });
+lb.addEventListener('close', () => { lbToken++; oceanNow?.stop(); });
+
+/* ════════════════════ LIGHTBOX OCEAN — three.js WebGPURenderer + TSL ════════════════════
+   放大觀看時，整張圖化為海面：
+   · 水紋 —— 數組隨洋流漂移的波列，以光影（斜面明暗＋細亮紋）呈現，畫面位移 ≤ 1px，圖與字保持清晰；
+   · 海浪 —— GPU 高度場波動方程（ping-pong 半浮點紋理），洋流撞上圖片邊緣處持續注入能量，
+              浪只在邊緣帶翻湧、碎成白沫並向外濺起水花；音樂越強浪越大；
+   · 互動 —— 拖曳撥水、點一下圖片投下水滴；點圖片外側關閉。
+   WebGPU 不可用時 WebGPURenderer 自動退回 WebGL2；模組載入失敗、file:// 或 reduced-motion 時維持靜態圖。 */
+const THREE_GPU_URL = 'https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.webgpu.min.js';
+let oceanP = null, oceanNow = null, oceanErr = '';
+function getOcean() {
+  if (!CAN_EMBED) return Promise.resolve(null);
+  return oceanP ??= import(THREE_GPU_URL).then(createOcean)
+    .then(o => (oceanNow = o))
+    .catch(err => { oceanErr = err?.message || String(err); console.warn('[ocean] 海浪特效無法啟用，改用靜態圖', err); return null; });
+}
+
+async function createOcean(G) {
+  const { uniform, texture, uv, vec2, vec3, vec4, float, sin, cos, abs, max, min, mix, smoothstep,
+          clamp, exp, pow, length, dot, normalize, saturate, select, mx_noise_float, mx_noise_vec3 } = G.TSL;
+
+  const canvas = document.createElement('canvas');
+  canvas.className = 'lb-ocean'; canvas.setAttribute('aria-hidden', 'true');
+  lb.prepend(canvas);
+  const renderer = new G.WebGPURenderer({ canvas, antialias: false });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  try { await renderer.init(); } catch (err) { canvas.remove(); throw err; }
+  renderer.setClearColor(0x000000, 1);
+  const backend = renderer.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL2';
+  console.info(`[ocean] backend: ${backend}`);
+
+  /* ── uniforms ── */
+  const uTime = uniform(0), uAspect = uniform(1), uAudio = uniform(0);
+  const uTexel = uniform(new G.Vector2(1 / 256, 1 / 256));
+  const uRect = uniform(new G.Vector4(.2, .2, .8, .8));      // image rect in canvas uv (x0, y0, x1, y1); quad uv is top-left origin
+  const uDir = uniform(new G.Vector2(1, 0));                  // mean current direction
+  const uPtr = uniform(new G.Vector4(0, 0, 0, 0));            // pointer segment (prev.xy → cur.xy) in uv
+  const uPtrK = uniform(0), uDrop = uniform(new G.Vector3(0, 0, 0));
+
+  /* ── shared field helpers (world space: x scaled by aspect, units = canvas height) ── */
+  const A = vec2(uAspect, 1);
+  const R0 = uRect.xy.mul(A), R1 = uRect.zw.mul(A);
+  const flowAt = w => uDir.mul(.75).add(mx_noise_vec3(vec3(w.mul(1.7), uTime.mul(.07))).xy.mul(.9));
+
+  /* ── wave simulation: r = height, g = velocity ── */
+  const rtOpts = { type: G.HalfFloatType, depthBuffer: false, minFilter: G.LinearFilter, magFilter: G.LinearFilter };
+  const rtA = new G.RenderTarget(256, 256, rtOpts), rtB = new G.RenderTarget(256, 256, rtOpts);
+
+  function simMaterial(src) {
+    const p = uv(), w = p.mul(A);
+    const at = (dx, dy) => texture(src.texture, p.add(vec2(dx, dy).mul(uTexel)));
+    const c = at(0, 0), h = c.r;
+    const avg = at(1, 0).r.add(at(-1, 0).r).add(at(0, 1).r).add(at(0, -1).r).mul(.25);
+    // distances to the four image edges, and how hard the current presses against each
+    const dL = w.x.sub(R0.x), dR = R1.x.sub(w.x), dB = w.y.sub(R0.y), dT = R1.y.sub(w.y);
+    const f = flowAt(w);
+    const edge = (d, n) => max(dot(f, n), 0).mul(exp(d.mul(-90)));
+    const press = edge(dL, vec2(-1, 0)).add(edge(dR, vec2(1, 0))).add(edge(dB, vec2(0, -1))).add(edge(dT, vec2(0, 1)));
+    // swell fronts riding the current: they surge in sets and break where they meet the edge
+    const dn = normalize(uDir);
+    const phase = dot(w, dn).mul(24).sub(uTime.mul(3.6)).add(mx_noise_float(vec3(w.mul(2.5), uTime.mul(.15))).mul(3));
+    const sets = mx_noise_float(vec3(w.mul(5), uTime.mul(.5))).mul(.5).add(.6);
+    const surge = smoothstep(.45, 1, sin(phase)).mul(sets);
+    const force = press.mul(surge).mul(uAudio.mul(1.6).add(.6)).mul(.006);
+    // pointer wake (segment) + click drop
+    const pa = uPtr.xy.mul(A), pb = uPtr.zw.mul(A), ab = pb.sub(pa);
+    const tSeg = saturate(dot(w.sub(pa), ab).div(max(dot(ab, ab), 1e-6)));
+    const wake = smoothstep(.03, 0, length(w.sub(pa.add(ab.mul(tSeg))))).mul(uPtrK).mul(-.008);
+    const drop = smoothstep(.04, 0, length(w.sub(uDrop.xy.mul(A)))).mul(uDrop.z).mul(-.05);
+    // surf lives only in a band along the edges: water further in is damped back to gentle ripples
+    const shore = exp(min(min(dL, dR), min(dB, dT)).mul(-45));
+    const v = c.g.add(avg.sub(h).mul(1.9)).mul(mix(.955, .99, shore)).add(force).add(wake).add(drop);
+    const inside = min(min(dL, dR), min(dB, dT)).greaterThan(0);
+    const m = new G.NodeMaterial();
+    m.fragmentNode = select(inside, vec4(h.add(v).mul(.9995), v, 0, 1), vec4(0, 0, 0, 1));
+    return m;
+  }
+  const simAB = simMaterial(rtA), simBA = simMaterial(rtB);
+
+  /* ── display ── */
+  const placeholder = new G.Texture();
+  const p = uv(), w = p.mul(A), px = uTexel.y.mul(.35);
+  const hs = (dx, dy) => texture(rtA.texture, p.add(vec2(dx, dy).mul(uTexel))).r;
+  const h = hs(0, 0);
+  const size = R1.sub(R0);
+  const q = w.sub(R0).div(size);                                       // local image uv
+  const dEdge = min(min(q.x, float(1).sub(q.x)).mul(size.x), min(q.y, float(1).sub(q.y)).mul(size.y));
+  const shore = exp(dEdge.mul(-40));
+  // water ripples: a few wave trains drifting with the current. Analytic slopes, so they can light the surface
+  // strongly while bending the picture by barely a pixel: the image and its lettering stay sharp.
+  const wobble = mx_noise_float(vec3(w.mul(2.2), uTime.mul(.12))).mul(2.4);
+  let slope = vec2(0, 0);
+  for (const [turn, amp, k, speed] of [[0, 1, 34, 1.7], [.3, .75, 47, 2.2], [-.35, .65, 61, 2.7], [.7, .4, 83, 3.3]]) {
+    const c = Math.cos(turn), sn = Math.sin(turn);
+    const d = vec2(uDir.x.mul(c).sub(uDir.y.mul(sn)), uDir.x.mul(sn).add(uDir.y.mul(c)));
+    slope = slope.add(d.mul(cos(dot(w, d).mul(k).sub(uTime.mul(speed)).add(wobble)).mul(amp)));
+  }
+  slope = slope.mul(.35);                                               // |slope| ≲ 1
+  const simGrad = vec2(hs(1, 0).sub(hs(-1, 0)), hs(0, 1).sub(hs(0, -1)));
+  // displacement: ripples ≤ ~1px everywhere; the surf may bend the picture only inside the shore band
+  const refr = slope.mul(.0012).add(simGrad.mul(mix(.04, .2, shore))).div(size);
+  const uvI = clamp(q.add(refr), 0, 1);
+  const img = texture(placeholder, uvI.mul(vec2(1, -1)).add(vec2(0, 1)));
+  let col = img.rgb;
+  // light the surface: soft slope shading plus thin moving glints trace the ripples
+  const grad = simGrad.add(slope.mul(.045));
+  const N = normalize(vec3(grad.mul(-6), 1));
+  const L = normalize(vec3(-.45, -.6, .65));             // light from the top-left (uv y points down)
+  const spec = pow(saturate(dot(N, normalize(L.add(vec3(0, 0, 1))))), 110).mul(.5);
+  const caustic = pow(saturate(dot(slope, normalize(L.xy)).mul(.5).add(.5)), 5).mul(.16);   // bright rim on each ripple's lit flank
+  col = col.mul(dot(N, L).sub(L.z).mul(.8).add(1)).add(vec3(1, .97, .9).mul(spec.add(caustic)));
+  // sea tint in troughs, foam on crests: both only along the struck edges
+  col = mix(col, col.mul(vec3(.55, .8, .95)), saturate(h.mul(-4)).mul(shore));
+  const foamTex = mx_noise_float(vec3(w.mul(70), uTime.mul(1.3))).mul(.5).add(.5);
+  const crest = smoothstep(.03, .14, h).mul(exp(dEdge.mul(-60))).add(exp(dEdge.mul(-140)).mul(smoothstep(.02, .08, length(grad).add(h.abs()))));
+  const foam = saturate(crest.mul(smoothstep(.25, .7, foamTex.add(crest.mul(.25)))));
+  col = mix(col, vec3(1, .96, .88), foam.mul(.8));
+  const insideMask = smoothstep(0, px, dEdge);
+  // outside: spray flung off the edge where the waves break
+  const nearest = clamp(w, R0, R1), away = w.sub(nearest), dist = length(away);
+  const nrm = away.div(max(dist, 1e-5)), tng = vec2(nrm.y.negate(), nrm.x);
+  const edgeUV = nearest.sub(nrm.mul(.006)).div(A);
+  const eh = texture(rtA.texture, edgeUV).r;
+  const energy = saturate(max(eh, 0).mul(5).add(abs(eh).mul(2)));
+  const drops = smoothstep(.62, .9, mx_noise_float(vec3(dot(w, tng).mul(140), dist.mul(90).sub(uTime.mul(6)), uTime.mul(.8))));
+  const spray = energy.mul(exp(dist.mul(-38))).mul(drops.mul(.9).add(exp(dist.mul(-160)).mul(.6)));
+  // black letterbox around the frame; only the spray and a faint gold rim where the surf breaks
+  const outside = vec3(1, .95, .85).mul(spray).add(vec3(.89, .72, .4).mul(energy.mul(exp(dist.mul(-90))).mul(.18)));
+  const disp = new G.MeshBasicNodeMaterial();
+  disp.colorNode = vec4(mix(outside, col, insideMask), 1);
+
+  const quad = new G.QuadMesh();
+  const loader = new G.TextureLoader(), cache = new Map();
+
+  /* ── state ── */
+  let raf = 0, t0 = 0, cw = 0, ch = 0, ptr = null, drag = 0;
+  function layout() {
+    const r = canvas.getBoundingClientRect(), ir = $('#lbImg').getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return;
+    if (r.width !== cw || r.height !== ch) {
+      cw = r.width; ch = r.height;
+      renderer.setSize(cw, ch, false);
+      const k = Math.min(1 / 3, 720 / Math.max(cw, ch));
+      const sw = Math.max(64, Math.round(cw * k)), sh = Math.max(64, Math.round(ch * k));
+      rtA.setSize(sw, sh); rtB.setSize(sw, sh);
+      uTexel.value.set(1 / sw, 1 / sh);
+      uAspect.value = cw / ch;
+    }
+    uRect.value.set((ir.left - r.left) / cw, (ir.top - r.top) / ch, (ir.right - r.left) / cw, (ir.bottom - r.top) / ch);
+  }
+  const toUV = e => { const r = canvas.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; };
+  const inRect = ([x, y]) => { const R = uRect.value; return x > R.x && x < R.z && y > R.y && y < R.w; };
+
+  canvas.addEventListener('pointermove', e => {
+    const c = toUV(e);
+    if (ptr) { drag = Math.min(1, drag + Math.hypot(c[0] - ptr[0], c[1] - ptr[1]) * 30); uPtr.value.set(ptr[0], ptr[1], c[0], c[1]); }
+    ptr = c;
+  });
+  canvas.addEventListener('pointerleave', () => { ptr = null; });
+  canvas.addEventListener('click', e => {
+    const c = toUV(e);
+    if (inRect(c)) uDrop.value.set(c[0], c[1], 1);
+    else lb.close();
+  });
+  addEventListener('resize', () => { if (raf) layout(); });
+
+  function frame(now) {
+    raf = requestAnimationFrame(frame);
+    const t = (now - t0) / 1000;
+    layout();
+    uTime.value = t;
+    const a = t * .06 + Math.sin(t * .11) * 1.1;
+    uDir.value.set(Math.cos(a), Math.sin(a));
+    uAudio.value = level;
+    uPtrK.value = drag; drag *= .88;
+    for (let i = 0; i < 2; i++) {                       // two sub-steps per frame; display always reads rtA
+      quad.material = simAB; renderer.setRenderTarget(rtB); quad.render(renderer);
+      quad.material = simBA; renderer.setRenderTarget(rtA); quad.render(renderer);
+      uDrop.value.z = 0;
+    }
+    renderer.setRenderTarget(null);
+    quad.material = disp; quad.render(renderer);
+  }
+
+  return {
+    backend,
+    load(url) {
+      if (!cache.has(url)) cache.set(url, loader.loadAsync(url).then(tx => { tx.colorSpace = G.SRGBColorSpace; return tx; }).catch(() => null));
+      return cache.get(url);
+    },
+    start(tex) {
+      img.value = tex;
+      cw = ch = 0; layout();
+      for (const rt of [rtA, rtB]) { renderer.setRenderTarget(rt); renderer.clear(); }
+      renderer.setRenderTarget(null);
+      t0 = performance.now(); drag = 0; ptr = null;
+      cancelAnimationFrame(raf); raf = requestAnimationFrame(frame);
+      lb.classList.add('ocean-on');
+    },
+    stop() { cancelAnimationFrame(raf); raf = 0; lb.classList.remove('ocean-on'); }
+  };
+}
 
 /* ════════════════════ VIEW TRANSITIONS ════════════════════ */
 let view = 'home', busy = false;
